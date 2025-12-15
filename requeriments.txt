@@ -1,0 +1,1 @@
+pyinstaller --noconsole --onefile --collect-all customtkinter --add-data "src;src" --distpath "D:\Proyectos para Visual Studio Code\Envio de mensajes por whatsapp auto\wsa" main.py
