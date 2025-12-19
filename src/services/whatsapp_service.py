@@ -1,33 +1,64 @@
 import time
 import os
+import sys
+import subprocess
+import platform
+import base64
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
 from webdriver_manager.chrome import ChromeDriverManager
 import config
 
+# --- CONFIGURACIÓN DE LOGS ---
+if getattr(sys, 'frozen', False):
+    ROOT_DIR = os.path.dirname(sys.executable)
+else:
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+LOG_FILE = os.path.join(ROOT_DIR, "registro_bot.txt")
+
+def log(msg):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
 class WhatsAppBot:
     def __init__(self):
         self.driver = None
         self.wait = None
+        self.os_name = platform.system()
 
     def start_browser(self):
-        """Inicia el navegador con configuración robusta"""
+        log("Iniciando navegador...")
         opts = Options()
         opts.add_argument("--start-maximized")
         opts.add_argument("--disable-infobars")
         opts.add_argument(f"user-data-dir={config.USER_DATA_DIR}")
         opts.add_argument("--disable-gpu")
+        opts.add_argument("--ignore-certificate-errors")
         
+        opts.add_experimental_option("prefs", {
+            "profile.default_content_setting_values.clipboard": 1
+        })
+
         service = Service(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=service, options=opts)
-        self.wait = WebDriverWait(self.driver, 30) # Timeout aumentado para subida de imágenes
+        self.wait = WebDriverWait(self.driver, config.WAIT_TIMEOUT)
         self.driver.get("https://web.whatsapp.com")
+        log("Navegador abierto.")
 
     def is_logged_in(self):
         try:
@@ -50,7 +81,7 @@ class WhatsAppBot:
         except: pass
 
     def send_message(self, phone, message, image_path=None):
-        """Orquestador principal de envíos"""
+        log(f"--- Iniciando envío a {phone} ---")
         clean_n = phone.replace("+", "").replace(" ", "").strip()
         if not clean_n.isdigit():
             raise Exception("Número mal formado")
@@ -58,143 +89,171 @@ class WhatsAppBot:
         url = f"https://web.whatsapp.com/send?phone={clean_n}"
         self.driver.get(url)
 
-        # 1. Esperar Carga (Chat o Popup error)
         try:
             self.wait.until(
-                lambda d: d.find_elements(By.CSS_SELECTOR, "#main div[contenteditable='true']") or 
+                lambda d: d.find_elements(By.ID, "main") or 
                           d.find_elements(By.CSS_SELECTOR, "div[data-animate-modal-popup='true']")
             )
+            log("Chat cargado.")
         except TimeoutException:
+            log("Error: Timeout esperando carga del chat")
             raise Exception("Timeout esperando carga del chat")
 
-        # 2. Validar Número
-        invalid = self.driver.find_elements(By.CSS_SELECTOR, "div[data-animate-modal-popup='true']")
+        time.sleep(1)
+        invalid = self.driver.find_elements(By.XPATH, "//div[contains(text(), 'inválido') or contains(text(), 'invalid')]")
         if invalid:
-            if "inválido" in invalid[0].text.lower() or "invalid" in invalid[0].text.lower():
-                try: invalid[0].find_element(By.CSS_SELECTOR, "div[role='button']").click()
-                except: pass
-                raise Exception("Número Inválido")
+            log("Número inválido.")
+            try: invalid[0].find_element(By.CSS_SELECTOR, "div[role='button']").click()
+            except: pass
+            raise Exception("Número Inválido")
 
-        time.sleep(1) # Estabilización
-
-        # 3. Enviar Contenido
         if image_path and os.path.exists(image_path):
             self._send_attachment(image_path, message)
         elif message:
             self._send_text_only(message)
         
-        time.sleep(1) # Pausa técnica
+        log("--- Envío finalizado ---")
+        time.sleep(1)
+
+    def _copy_image_to_clipboard(self, image_path):
+        abs_path = os.path.abspath(image_path)
+        log(f"Copiando imagen: {abs_path}")
+        if self.os_name == 'Windows':
+            cmd = f"powershell -c \"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{abs_path}'))\""
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif self.os_name == 'Darwin':
+            cmd = f"osascript -e 'tell application \"Finder\" to set the clipboard to (POSIX file \"{abs_path}\")'"
+            subprocess.run(cmd, shell=True, check=True)
+        elif self.os_name == 'Linux':
+            mime = "image/png" if abs_path.lower().endswith(".png") else "image/jpeg"
+            subprocess.run(["xclip", "-selection", "clipboard", "-t", mime, "-i", abs_path], check=True)
+
+    def _copy_text_to_clipboard(self, text):
+        log("Copiando texto...")
+        if self.os_name == 'Windows':
+            text_b64 = base64.b64encode(text.encode('utf-16le')).decode()
+            cmd = f"powershell -c \"$str = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('{text_b64}')); Set-Clipboard -Value $str\""
+            subprocess.run(cmd, shell=True)
+        elif self.os_name == 'Darwin':
+            p = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            p.communicate(input=text.encode('utf-8'))
+        elif self.os_name == 'Linux':
+            p = subprocess.Popen(['xclip', '-selection', 'clipboard'], stdin=subprocess.PIPE)
+            p.communicate(input=text.encode('utf-8'))
 
     def _send_attachment(self, path, caption):
-        """
-        Lógica CRÍTICA de envío de imagen + caption.
-        Maneja el Editor de Medios de forma explícita.
-        """
-        # A. Cargar Imagen (Input oculto estándar)
-        # Aunque el flujo manual sea Ctrl+V, send_keys al input es más estable para automatización
+        """Flujo estricto: Pegar Imagen -> VALIDAR MODAL -> Pegar Texto -> Enter"""
+        modifier = Keys.COMMAND if self.os_name == 'Darwin' else Keys.CONTROL
+        
+        # 1. PEGAR IMAGEN
         try:
-            input_box = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
-            input_box.send_keys(path)
+            self._copy_image_to_clipboard(path)
+            time.sleep(1.0)
+            
+            # Click en chat principal
+            log("Enfocando chat principal...")
+            main_chat_box = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#main footer div[contenteditable='true']")))
+            main_chat_box.click()
+            time.sleep(0.5)
+            
+            log("Pegando imagen (Ctrl+V)...")
+            actions = ActionChains(self.driver)
+            actions.key_down(modifier).send_keys('v').key_up(modifier).perform()
+            
         except Exception as e:
-            raise Exception(f"No se pudo cargar la imagen al input: {e}")
+            log(f"Error pegando imagen: {e}")
+            raise Exception(f"Fallo imagen: {e}")
 
-        # B. Esperar al Editor de Medios
-        # El indicador más fiable de que el editor cargó es el botón de enviar (círculo verde con avión)
-        send_icon_selector = (By.CSS_SELECTOR, "span[data-icon='send']")
+        # 2. ESPERAR AL EDITOR (CRÍTICO)
+        # Esperamos a que aparezca un input de texto que NO sea el del chat principal.
+        # Esto confirma que el modal se abrió.
+        log("Esperando a que se abra el editor de imagen...")
+        modal_opened = False
         try:
-            self.wait.until(EC.visibility_of_element_located(send_icon_selector))
+            # Buscamos un contenteditable que NO tenga ancestro 'main'
+            # Ojo: El editor de imagen vive fuera de #main
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//div[@contenteditable='true'][not(ancestor::div[@id='main'])]"))
+            )
+            log("¡Editor de imagen detectado!")
+            modal_opened = True
         except TimeoutException:
-            raise Exception("Timeout: La imagen no cargó o el editor no apareció.")
+            log("ALERTA: No se detectó el editor de imagen en 10s. Posiblemente la imagen no se pegó.")
+            # Si no abre el modal, no intentamos pegar el texto para evitar enviarlo al chat equivocado
+            raise Exception("La imagen no cargó el editor. Abortando envío de texto.")
 
-        # C. Manejar Caption (Si existe)
-        if caption:
+        # 3. PEGAR TEXTO (Solo si el modal abrió)
+        if caption and modal_opened:
             try:
-                # Buscar input visible en el editor (evitar el input del chat de fondo)
-                # El input del editor suele tener clases específicas, pero contenteditable es universal
-                text_inputs = self.driver.find_elements(By.CSS_SELECTOR, "div[contenteditable='true']")
-                caption_box = None
+                log("Copiando caption al portapapeles...")
+                self._copy_text_to_clipboard(caption)
+                time.sleep(1.0) # Tiempo para que el SO cambie el portapapeles
                 
-                # Iterar para encontrar el que está visible y activo
-                for inp in text_inputs:
-                    if inp.is_displayed():
-                        # Un check extra: altura razonable (el del chat fondo a veces reporta displayed)
-                        if inp.size['height'] > 10: 
-                            caption_box = inp
-                            break
+                # Buscar el input DEL MODAL (Excluyendo el del chat principal)
+                caption_box = self.driver.find_element(By.XPATH, "//div[@contenteditable='true'][not(ancestor::div[@id='main'])]")
                 
                 if caption_box:
+                    log("Enfocando input del caption...")
                     caption_box.click()
-                    time.sleep(0.3)
-                    # Escribir mensaje
-                    for line in caption.split('\n'):
-                        caption_box.send_keys(line)
-                        caption_box.send_keys(Keys.SHIFT + Keys.ENTER)
+                    time.sleep(0.5)
+                    
+                    # Verificamos foco activo por si acaso
+                    active_elem = self.driver.switch_to.active_element
+                    if active_elem != caption_box:
+                        log("El foco no estaba en el caption, forzando con JS...")
+                        self.driver.execute_script("arguments[0].focus();", caption_box)
+                    
+                    log("Pegando texto en la descripción...")
+                    actions = ActionChains(self.driver)
+                    actions.key_down(modifier).send_keys('v').key_up(modifier).perform()
+                    time.sleep(1.0) 
+                    
+                    log("Enviando ENTER...")
+                    actions.send_keys(Keys.ENTER).perform()
                 else:
-                    print("⚠️ Warning: No se encontró cuadro de texto para el caption.")
-            
+                    log("No se encontró el input del caption en el modal.")
+
             except Exception as e:
-                print(f"⚠️ Error escribiendo caption (se enviará solo imagen): {e}")
+                log(f"Error pegando texto: {e}")
 
-        # D. ENVIAR (Click Prioritario)
-        time.sleep(0.5) # Pequeña espera para que el botón se habilite tras escribir
-        sent = False
-        
-        try:
-            # 1. Intentar Click Nativo
-            btn_send = self.wait.until(EC.element_to_be_clickable(send_icon_selector))
-            btn_send.click()
-            sent = True
-        except ElementClickInterceptedException:
-            # 2. Respaldo: Click Javascript (Si algo tapa el botón)
-            try:
-                btn_send = self.driver.find_element(*send_icon_selector)
-                self.driver.execute_script("arguments[0].click();", btn_send)
-                sent = True
-            except: pass
-        
-        if not sent:
-             # 3. Respaldo Final: Enter en el caption box
-             try:
-                 webdriver.ActionChains(self.driver).send_keys(Keys.ENTER).perform()
-             except: pass
+        elif not caption and modal_opened:
+            # Solo imagen, dar enter
+            log("Sin caption. Enviando imagen...")
+            ActionChains(self.driver).send_keys(Keys.ENTER).perform()
 
-        # E. Validación de Salida
+        # 4. VALIDAR ENVÍO
+        time.sleep(2)
+        # Si el editor sigue abierto (botón send visible), hacemos click
         try:
-            # Esperar a que el botón de enviar DESAPAREZCA (significa que el editor se cerró)
-            self.wait.until(EC.invisibility_of_element_located(send_icon_selector))
-        except TimeoutException:
-            raise Exception("❌ Error Crítico: El mensaje se quedó trabado en el editor (No se envió).")
+            send_btn = self.driver.find_elements(By.CSS_SELECTOR, "span[data-icon='send']")
+            # Filtramos los visibles
+            visible_btns = [btn for btn in send_btn if btn.is_displayed()]
+            if visible_btns:
+                log("El mensaje no se fue con Enter. Haciendo click en botón enviar...")
+                visible_btns[-1].click()
+        except: pass
+
+        log("Proceso de adjunto finalizado.")
 
     def _send_text_only(self, message):
-        """Envío robusto para solo texto"""
-        box_selector = (By.CSS_SELECTOR, "#main footer div[contenteditable='true']")
         try:
-            chat_box = self.wait.until(EC.element_to_be_clickable(box_selector))
-            chat_box.click()
+            box = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#main footer div[contenteditable='true']")))
+            box.click()
+            box.send_keys(Keys.CONTROL + "a")
+            box.send_keys(Keys.BACKSPACE)
             
-            # Limpiar y Escribir
-            chat_box.send_keys(Keys.CONTROL + "a")
-            chat_box.send_keys(Keys.BACKSPACE)
+            self._copy_text_to_clipboard(message)
+            modifier = Keys.COMMAND if self.os_name == 'Darwin' else Keys.CONTROL
             
-            lines = message.split('\n')
-            for i, line in enumerate(lines):
-                chat_box.send_keys(line)
-                if i < len(lines) - 1:
-                    chat_box.send_keys(Keys.SHIFT + Keys.ENTER)
-            
+            actions = ActionChains(self.driver)
+            actions.key_down(modifier).send_keys('v').key_up(modifier).perform()
             time.sleep(0.5)
-            chat_box.send_keys(Keys.ENTER)
-            
-            # Confirmar envío (caja vacía)
-            WebDriverWait(self.driver, 3).until(lambda d: chat_box.text.strip() == "")
-            
-        except Exception:
-            # Fallback Click
-            try:
-                self.driver.find_element(By.CSS_SELECTOR, "button[aria-label='Send'], span[data-icon='send']").click()
-            except:
-                pass
+            actions.send_keys(Keys.ENTER).perform()
+            log("Texto enviado.")
+        except Exception as e:
+            log(f"Error texto: {e}")
 
     def close(self):
+        log("Cerrando.")
         if self.driver:
             self.driver.quit()
